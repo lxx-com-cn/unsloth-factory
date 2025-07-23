@@ -1,0 +1,480 @@
+# src/chat/chat.py
+import os
+import re
+import logging
+import shutil
+import gc
+import warnings
+import json
+import sys
+import torch
+import tempfile
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from unsloth import FastLanguageModel
+from threading import Thread
+from src.utils.helpers import (
+    deep_clean_response, 
+    validate_domain_response,
+    ensure_template_compatibility,
+    ensure_tokenizer_compatibility,
+    log_memory_usage
+)
+
+# 配置日志 - 禁用控制台输出
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("chat.log")]
+)
+logger = logging.getLogger(__name__)
+
+# 忽略特定警告
+warnings.filterwarnings("ignore", 
+    message=".*Input type into Linear4bit is torch.float16.*")
+warnings.filterwarnings("ignore", 
+    message=".*Merge lora module to 4-bit linear.*")
+
+class ChatSystem:
+    """交互式聊天系统"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.model = None
+        self.tokenizer = None
+        self.template = None
+        self.temp_model_path = None
+        self.temp_adapter_path = None
+        self.state = "waiting"  # waiting, think, answer, done
+        self.buffer = ""
+        self.history = []  # 存储对话历史
+        self.stop_sequences = ["</answer>", "<|im_end|>", "</s>", "\nHuman:", "\nAssistant:"]  # 停止序列
+        self.domain = args.domain  # 保存领域信息
+        
+        # 需要过滤的模式列表 - 已添加占位符过滤
+        self.filter_patterns = [
+            r"请严格按以下格式回答.*?<answer>",
+            r"<\|system\|>.*?</s>",
+            r"<\|user\|>.*?</s>",
+            r"<\|assistant\|>.*?</s>",
+            r"Human:.*?Assistant:",
+            r"\[在此进行思维链分析\]",  # 过滤占位符
+            r"请严格按以下格式回答"     # 过滤格式指令
+        ]
+    
+    def optimize_memory(self):
+        """优化内存使用"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+    
+    def filter_content(self, text):
+        """过滤掉不需要的内容"""
+        for pattern in self.filter_patterns:
+            text = re.sub(pattern, "", text, flags=re.DOTALL)
+        return text.strip()
+    
+    def build_strict_prompt(self, user_input, system_prompt):
+        """构建严格的提示格式 - 确保模型遵循指定格式"""
+        # 基础系统提示
+        prompt = ""
+        if system_prompt:
+            prompt += f"<|system|>\n{system_prompt}</s>\n"
+        
+        # 添加上下文历史（如果未禁用上下文）
+        if not self.args.no_context and self.history:
+            for role, content in self.history:
+                if role == "user":
+                    prompt += f"<|user|>\n{content}</s>\n"
+                elif role == "assistant":
+                    # 只保留<answer>标签内的内容
+                    answer_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+                    if answer_match:
+                        answer_content = answer_match.group(1).strip()
+                        prompt += f"<|assistant|>\n{answer_content}</s>\n"
+        
+        # 添加当前用户输入
+        prompt += f"<|user|>\n{user_input}</s>\n"
+        
+        # 添加严格的格式指令 - 优化位置
+        if self.args.think_chain:
+            prompt += (
+                "<|assistant|>\n"
+                "请严格按以下格式回答：\n"
+                "<think>\n"
+            )
+        else:
+            prompt += "<|assistant|>\n"
+        
+        return prompt
+    
+    def contains_stop_sequence(self, text):
+        """检查文本中是否包含停止序列（增强版）"""
+        # 基础停止序列检查
+        for seq in self.stop_sequences:
+            if seq in text:
+                return True
+        
+        # 增强模式匹配 - 添加占位符检测
+        patterns = [
+            r"请严格按以下格式回答",
+            r"<\|system\|>.*?</s>",
+            r"<\|user\|>.*?</s>",
+            r"<\|assistant\|>",
+            r"\[在此进行思维链分析\]"  # 占位符停止序列
+        ]
+        
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return True
+        
+        return False
+    
+    def process_streaming_token(self, token):
+        """处理流式token，分离思维链和正式回答（优化版本）"""
+        # 更新缓冲区
+        self.buffer += token
+        
+        output = ""
+        state_changed = False
+        
+        # 状态机处理
+        if self.state == "waiting":
+            # 等待<think>标签开始 - 更严格的检测
+            if "<think>" in self.buffer:
+                # 移除<think>标签前的所有内容
+                start_index = self.buffer.find("<think>") + len("<think>")
+                self.buffer = self.buffer[start_index:]
+                self.state = "think"
+                output = "<思维链分析>\n\n"  # 添加换行符使输出更美观
+                state_changed = True
+            # 检测直接开始的正式回答
+            elif "<answer>" in self.buffer:
+                # 直接进入回答状态
+                start_index = self.buffer.find("<answer>") + len("<answer>")
+                self.buffer = self.buffer[start_index:]
+                self.state = "answer"
+                output = "<正式回答>\n\n"
+                state_changed = True
+            # 检测没有思维链的直接回答
+            elif "<|assistant|>" in self.buffer and not self.args.think_chain:
+                start_index = self.buffer.find("<|assistant|>") + len("<|assistant|>")
+                self.buffer = self.buffer[start_index:]
+                self.state = "answer"
+                output = ""
+                state_changed = True
+        
+        elif self.state == "think":
+            # 处理思维链内容
+            if "</think>" in self.buffer:
+                # 提取思维链内容
+                think_end = self.buffer.find("</think>")
+                think_content = self.buffer[:think_end]
+                
+                # 更新缓冲区
+                self.buffer = self.buffer[think_end + len("</think>"):]
+                self.state = "answer"
+                
+                # 返回内容
+                output = think_content + "\n\n<正式回答>\n\n"
+                state_changed = True
+            # 检测提前出现的<answer>
+            elif "<answer>" in self.buffer:
+                # 切换到回答状态
+                start_index = self.buffer.find("<answer>") + len("<answer>")
+                self.buffer = self.buffer[start_index:]
+                self.state = "answer"
+                output = "\n\n<正式回答>\n\n"
+                state_changed = True
+            else:
+                # 返回当前内容
+                output = self.buffer
+                self.buffer = ""
+        
+        elif self.state == "answer":
+            # 处理正式回答
+            if "</answer>" in self.buffer:
+                # 提取回答内容
+                answer_end = self.buffer.find("</answer>")
+                answer_content = self.buffer[:answer_end]
+                
+                # 更新缓冲区
+                self.buffer = self.buffer[answer_end + len("</answer>"):]
+                self.state = "done"
+                
+                # 返回内容
+                output = answer_content
+                state_changed = True
+            elif self.contains_stop_sequence(self.buffer):
+                # 检测到停止序列，提前结束
+                self.state = "done"
+                output = self.buffer
+                self.buffer = ""
+            else:
+                # 返回当前内容
+                output = self.buffer
+                self.buffer = ""
+        
+        # 新增：done状态后忽略所有内容
+        elif self.state == "done":
+            output = ""
+            self.buffer = ""
+        
+        # 如果没有状态变化，直接返回token
+        if not state_changed and not output:
+            output = token
+        
+        # 过滤占位符内容
+        output = re.sub(r"\[在此进行思维链分析\]", "", output)
+        
+        return output, self.state
+    
+    def validate_response(self, response, user_input):
+        """验证响应并进行领域处理"""
+        # 确保响应是字符串
+        if not response or not isinstance(response, str):
+            return "", ""
+        
+        # 提取结构化内容
+        think_content = ""
+        answer_content = ""
+        
+        # 尝试提取完整结构
+        think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+        answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
+        
+        if think_match and answer_match:
+            think_content = self.filter_content(think_match.group(1).strip())
+            answer_content = self.filter_content(answer_match.group(1).strip())
+        elif think_match:
+            think_content = self.filter_content(think_match.group(1).strip())
+        elif answer_match:
+            answer_content = self.filter_content(answer_match.group(1).strip()
+        
+        # 如果仍有内容，附加到回答部分
+        if response.strip() and not answer_content:
+            answer_content = self.filter_content(response.strip())
+        
+        # 领域验证
+        if answer_content:
+            try:
+                answer_content = validate_domain_response(
+                    answer_content, 
+                    user_input, 
+                    self.domain  # 传递领域参数
+                )
+            except Exception as e:
+                logger.error(f"{self.domain}领域验证失败: {str(e)}")
+        
+        return think_content, answer_content
+    
+    def load_model(self):
+        """加载模型"""
+        # 确保使用GPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 修复模板路径处理
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        templates_dir = os.path.join(current_dir, "..", "..", "templates")
+        template_path = os.path.join(templates_dir, f"{self.args.model_template}.json")
+        
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"模板文件不存在: {template_path}")
+        
+        # 确保模板兼容
+        self.template = ensure_template_compatibility(template_path)
+        if not self.template:
+            raise ValueError(f"模板修复失败: {template_path}")
+        
+        max_seq_length = getattr(self.args, "max_seq_length", 8192)
+        
+        if not os.path.exists(self.args.model):
+            raise FileNotFoundError(f"基础模型路径不存在: {self.args.model}")
+        
+        # 确保 tokenizer 兼容
+        model_path = ensure_tokenizer_compatibility(self.args.model)
+        self.temp_model_path = model_path if model_path != self.args.model else None
+        
+        # 检查是否是Qwen3模型
+        is_qwen3 = "qwen3" in self.args.model_template.lower() or "qwen3" in self.args.model.lower()
+        
+        # 加载基础模型
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            trust_remote_code=True
+        )
+        
+        # 使用4位量化加载模型
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            load_in_4bit=True,
+            trust_remote_code=True
+        )
+        
+        if self.args.adapter:
+            adapter_path = ensure_tokenizer_compatibility(self.args.adapter)
+            self.temp_adapter_path = adapter_path if adapter_path != self.args.adapter else None
+            
+            # 加载适配器
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(
+                self.model,
+                adapter_path,
+                is_trainable=False
+            )
+            self.model = self.model.merge_and_unload()
+        
+        # 应用模板中的tokenizer设置
+        self.tokenizer.pad_token = self.template.get("pad_token", {}).get("content", self.tokenizer.eos_token)
+        self.tokenizer.bos_token = self.template.get("bos_token", {}).get("content", self.tokenizer.bos_token)
+        self.tokenizer.eos_token = self.template.get("eos_token", {}).get("content", self.tokenizer.eos_token)
+        
+        # 准备模型进行推理
+        self.model.eval()
+        if not is_qwen3:
+            try:
+                self.model = FastLanguageModel.for_inference(self.model)
+            except:
+                pass
+    
+    def start(self):
+        """启动聊天界面"""
+        try:
+            self.load_model()
+            
+            print("=" * 80)
+            print(f"{self.domain.capitalize()}专业助手已启动 (输入 'exit' 退出)")
+            print("=" * 80)
+            
+            if self.args.think_chain:
+                print("回答格式:")
+                print("1. <思维链分析>: 推理过程")
+                print("2. <正式回答>: 总结与建议")
+                print("=" * 80)
+            
+            system_prompt = self.args.system if self.args.system else self.template.get("default_system", "")
+            
+            while True:
+                try:
+                    # 重置状态
+                    self.state = "waiting"
+                    self.buffer = ""
+                    
+                    user_input = input("\n<用户>: ").strip()
+                    if user_input.lower() in ["exit", "quit"]:
+                        break
+                    if not user_input:
+                        continue
+                    
+                    # 构建严格格式的提示
+                    prompt = self.build_strict_prompt(user_input, system_prompt)
+                    
+                    # 优化内存使用
+                    self.optimize_memory()
+                    
+                    # 准备输入
+                    inputs = self.tokenizer(
+                        prompt, 
+                        return_tensors="pt", 
+                        truncation=True, 
+                        max_length=min(self.args.max_seq_length, 4096)
+                    )
+                    
+                    # 将输入移动到模型所在的设备
+                    device = self.model.device if hasattr(self.model, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu'
+                    
+                    # 修复: 正确访问字典中的input_ids
+                    input_ids = inputs["input_ids"].to(device)
+                    attention_mask = inputs["attention_mask"].to(device) if "attention_mask" in inputs else None
+                    
+                    # 计算最大新token数
+                    max_possible_tokens = self.args.max_seq_length - input_ids.shape[1]
+                    actual_max_tokens = min(self.args.max_new_tokens, max_possible_tokens)
+                    
+                    # 创建流式生成器
+                    streamer = TextIteratorStreamer(
+                        self.tokenizer, 
+                        skip_prompt=True,
+                        skip_special_tokens=True,
+                        timeout=120
+                    )
+                    
+                    # 生成参数
+                    generation_kwargs = {
+                        "input_ids": input_ids,
+                        "max_new_tokens": actual_max_tokens,
+                        "do_sample": True,
+                        "temperature": 0.7,
+                        "top_p": 0.9,
+                        "pad_token_id": self.tokenizer.eos_token_id,
+                        "eos_token_id": self.tokenizer.eos_token_id,
+                        "streamer": streamer
+                    }
+                    
+                    # 添加attention_mask（如果存在）
+                    if attention_mask is not None:
+                        generation_kwargs["attention_mask"] = attention_mask
+                    
+                    # 启动生成线程 - 修复语法错误
+                    thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+                    thread.start()
+                    
+                    # 启动流式输出
+                    print("\n<助手>: ", end="", flush=True)
+                    full_response = ""
+                    has_output = False  # 标记是否有实际输出
+                    
+                    for new_text in streamer:
+                        # 处理每个token
+                        display_text, state = self.process_streaming_token(new_text)
+                        
+                        # 打印处理后的文本
+                        if display_text:
+                            print(display_text, end="", flush=True)
+                            has_output = True
+                        
+                        full_response += new_text
+                        
+                        # 如果检测到done状态，结束流式输出
+                        if state == "done":
+                            break
+                    
+                    # 如果没有实际输出，添加提示
+                    if not has_output:
+                        print("<无内容生成>", end="", flush=True)
+                    
+                    # 添加结束分隔线
+                    print("\n" + "=" * 60)
+                    
+                    # 更新对话历史
+                    if not self.args.no_context:
+                        # 保存正式回答部分到历史
+                        _, answer_content = self.validate_response(full_response, user_input)
+                        if answer_content:
+                            self.history.append(("user", user_input))
+                            self.history.append(("assistant", f"<answer>\n{answer_content}\n</answer>"))
+                        
+                        # 限制历史长度
+                        if len(self.history) > 6:
+                            self.history = self.history[-6:]
+                    
+                except KeyboardInterrupt:
+                    print("\n退出聊天...")
+                    break
+                except Exception as e:
+                    print(f"发生错误: {e}")
+                    continue
+        except Exception as e:
+            print(f"无法启动聊天: {str(e)}")
+        finally:
+            # 清理显存
+            if self.model:
+                del self.model
+            self.optimize_memory()
+            
+            # 清理临时目录
+            if self.temp_model_path:
+                shutil.rmtree(self.temp_model_path, ignore_errors=True)
+            if self.temp_adapter_path:
+                shutil.rmtree(self.temp_adapter_path, ignore_errors=True)

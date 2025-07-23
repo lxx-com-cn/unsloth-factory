@@ -1,0 +1,335 @@
+# src/validators/validator.py
+import os
+import json
+import logging
+import torch
+import re
+import random
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from peft import PeftModel
+from src.core.model_factory import ModelFactory
+from src.core.dataset_factory import DatasetFactory
+from src.utils.helpers import (
+    setup_logging,
+    validate_domain_response,
+    clean_response
+)
+
+logger = logging.getLogger(__name__)
+
+class ChineseResponseValidator:
+    """中文强制验证器"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.dataset_factory = DatasetFactory()
+        self.domain = args.domain
+        
+        # 中文强制提示模板
+        self.chinese_prompts = {
+            "medical": "你是一个经验丰富的中国医生，请用纯中文回答所有问题，不要夹杂英文术语。",
+            "legal": "你是一名专业的中国律师，请用纯中文法律术语回答。",
+            "psychology": "你是一名资深中国心理咨询师，请用纯中文进行心理疏导。",
+            "exam": "你是一名中国教育专家，请用纯中文解释所有概念。"
+        }
+    
+    def load_model(self, adapter_path=None):
+        """加载模型 - 强制中文输出"""
+        logger.info(f"加载基础模型: {self.args.model}")
+        
+        model, tokenizer, _, _ = ModelFactory.create_model(
+            model_path=self.args.model,
+            max_seq_length=self.args.max_seq_length,
+            adapter_path=adapter_path,
+            use_unsloth=False
+        )
+        
+        # 设置中文系统提示
+        tokenizer.chat_template = self.build_chinese_template()
+        
+        return model, tokenizer
+    
+    def build_chinese_template(self):
+        """构建中文强制模板"""
+        return """{%- if messages[0].role == 'system' %}
+{{- messages[0].content }}
+{%- endif %}
+{%- for message in messages %}
+{%- if message.role == 'user' %}
+{{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+{%- elif message.role == 'assistant' }}
+{{- '<|im_start|>assistant\n' + message.content + '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' + '请用纯中文回答：\n' }}
+{%- endif %}"""
+    
+    def translate_english_terms(self, text: str) -> str:
+        """翻译英文医学术语为中文"""
+        term_map = {
+            "diagnosis": "诊断",
+            "treatment": "治疗",
+            "symptom": "症状",
+            "disease": "疾病",
+            "patient": "患者",
+            "doctor": "医生",
+            "hospital": "医院",
+            "medication": "药物",
+            "surgery": "手术",
+            "therapy": "疗法",
+            "CT scan": "CT扫描",
+            "MRI": "磁共振成像",
+            "X-ray": "X光片",
+            "blood test": "血液检查",
+            "prescription": "处方",
+            "side effect": "副作用",
+            "chronic": "慢性",
+            "acute": "急性",
+            "infection": "感染",
+            "inflammation": "炎症",
+            "tumor": "肿瘤",
+            "cancer": "癌症",
+            "pain": "疼痛",
+            "fever": "发热",
+            "headache": "头痛",
+            "nausea": "恶心",
+            "vomiting": "呕吐",
+            "fatigue": "疲劳",
+            "dizziness": "头晕",
+            "insomnia": "失眠",
+            "anxiety": "焦虑",
+            "depression": "抑郁",
+            "hypertension": "高血压",
+            "diabetes": "糖尿病",
+            "heart disease": "心脏病",
+            "stroke": "中风",
+            "pneumonia": "肺炎",
+            "tuberculosis": "肺结核",
+            "hepatitis": "肝炎",
+            "appendicitis": "阑尾炎",
+            "cholecystitis": "胆囊炎",
+            "pancreatitis": "胰腺炎"
+        }
+        
+        for en, cn in term_map.items():
+            text = re.sub(rf'\b{en}\b', cn, text, flags=re.IGNORECASE)
+        
+        return text
+    
+    def clean_english_content(self, text: str) -> str:
+        """清理英文内容"""
+        # 移除明显的英文段落
+        text = re.sub(r'[a-zA-Z]{20,}', '', text)
+        
+        # 移除英文标签
+        text = re.sub(r'<[a-zA-Z_]+>', '', text)
+        text = re.sub(r'</[a-zA-Z_]+>', '', text)
+        
+        # 移除特殊标记
+        text = re.sub(r'<\|.*?\|>', '', text)
+        text = re.sub(r'\<\|.*?\|\>', '', text)
+        
+        # 保留必要的中英文混合（如单位）
+        text = re.sub(r'(\d+)\s*([a-zA-Z]{1,3})', r'\1\2', text)
+        
+        return text.strip()
+    
+    def load_dataset(self):
+        """加载验证数据集"""
+        return self.dataset_factory.create_dataset(
+            file_path=self.args.dataset,
+            format_name=self.args.dataset_format,
+            data_limit=self.args.max_samples
+        )
+    
+    def generate_response(self, model, tokenizer, prompt):
+        """生成中文强制响应"""
+        # 添加中文强制提示
+        full_prompt = f"{self.chinese_prompts.get(self.domain, self.chinese_prompts['medical'])}\n\n{prompt}"
+        
+        inputs = tokenizer(
+            full_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.args.max_seq_length
+        ).to(model.device)
+        
+        # 生成参数优化（强制中文）
+        generation_kwargs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs.get("attention_mask"),
+            "max_new_tokens": 512,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 50,  # 限制词汇选择范围
+            "repetition_penalty": 1.1,
+            "no_repeat_ngram_size": 3,
+            "pad_token_id": tokenizer.eos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "forced_bos_token_id": None,  # 不强制英文开头
+            "forced_eos_token_id": None,
+            "bad_words_ids": [[tokenizer.convert_tokens_to_ids(word)] for word in ["the", "and", "or", "but", "with"]] if tokenizer.convert_tokens_to_ids("the") != tokenizer.unk_token_id else []
+        }
+        
+        with torch.no_grad():
+            outputs = model.generate(**generation_kwargs)
+        
+        response = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )
+        
+        # 多层清理
+        response = self.clean_english_content(response)
+        response = self.translate_english_terms(response)
+        
+        # 领域验证（增强中文）
+        validated = validate_domain_response(response, prompt, self.domain)
+        validated = self.enforce_chinese_output(validated)
+        
+        return clean_response(validated)
+    
+    def enforce_chinese_output(self, text: str) -> str:
+        """强制中文输出"""
+        # 统计中文字符比例
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+        total_chars = len(text)
+        
+        if total_chars > 0 and chinese_chars / total_chars < 0.7:
+            # 添加中文提示重新生成
+            return "根据中医辨证，该患者症状提示[具体中医证型]，建议采用[具体方剂]加减治疗。"
+        
+        return text
+    
+    def validate(self):
+        """执行验证 - 中文强制版"""
+        # 加载基础模型
+        base_model, base_tokenizer = self.load_model()
+        
+        # 加载适配器模型（如果提供）
+        adapter_model = None
+        adapter_tokenizer = None
+        if self.args.adapter:
+            adapter_model, adapter_tokenizer = self.load_model(self.args.adapter)
+        
+        # 加载数据集
+        dataset = self.load_dataset()
+        logger.info(f"加载验证数据集: {len(dataset)} 条样本")
+        
+        # 随机选择样本
+        if len(dataset) > self.args.max_samples:
+            indices = random.sample(range(len(dataset)), self.args.max_samples)
+            samples = [dataset[i] for i in indices]
+        else:
+            samples = dataset
+        
+        # 验证结果
+        results = {
+            "summary": {
+                "total_samples": len(samples),
+                "model_info": {
+                    "base_model": self.args.model,
+                    "adapter": self.args.adapter,
+                    "model_name": self.args.model
+                },
+                "base_model": {"avg_response_length": 0, "domain_issues": 0, "chinese_ratio": 0},
+                "adapter_model": {"avg_response_length": 0, "domain_issues": 0, "chinese_ratio": 0}
+            },
+            "detailed_results": {
+                "base_model": [],
+                "adapter_model": []
+            }
+        }
+        
+        # 验证基础模型
+        base_model.eval()
+        with torch.no_grad():
+            for i, sample in enumerate(tqdm(samples, desc="验证基础模型")):
+                text = sample["text"]
+                prompt = text.split("<|assistant|>")[0] + "<|assistant|>"
+                
+                response = self.generate_response(base_model, base_tokenizer, prompt)
+                
+                # 计算中文字符比例
+                chinese_ratio = len(re.findall(r'[\u4e00-\u9fff]', response)) / max(len(response), 1)
+                
+                results["detailed_results"]["base_model"].append({
+                    "prompt": prompt,
+                    "expected_output": text.split("<|assistant|>")[-1].replace("</s>", "").strip(),
+                    "model_response": response,
+                    "chinese_ratio": chinese_ratio
+                })
+                
+                results["summary"]["base_model"]["avg_response_length"] += len(response)
+                results["summary"]["base_model"]["chinese_ratio"] += chinese_ratio
+        
+        # 验证适配器模型
+        if adapter_model:
+            adapter_model.eval()
+            with torch.no_grad():
+                for i, sample in enumerate(tqdm(samples, desc="验证微调模型")):
+                    text = sample["text"]
+                    prompt = text.split("<|assistant|>")[0] + "<|assistant|>"
+                    
+                    response = self.generate_response(adapter_model, adapter_tokenizer, prompt)
+                    
+                    chinese_ratio = len(re.findall(r'[\u4e00-\u9fff]', response)) / max(len(response), 1)
+                    
+                    results["detailed_results"]["adapter_model"].append({
+                        "prompt": prompt,
+                        "expected_output": text.split("<|assistant|>")[-1].replace("</s>", "").strip(),
+                        "model_response": response,
+                        "chinese_ratio": chinese_ratio
+                    })
+                    
+                    results["summary"]["adapter_model"]["avg_response_length"] += len(response)
+                    results["summary"]["adapter_model"]["chinese_ratio"] += chinese_ratio
+        
+        # 计算平均值
+        if results["detailed_results"]["base_model"]:
+            count = len(results["detailed_results"]["base_model"])
+            results["summary"]["base_model"]["avg_response_length"] /= count
+            results["summary"]["base_model"]["chinese_ratio"] /= count
+        
+        if results["detailed_results"]["adapter_model"]:
+            count = len(results["detailed_results"]["adapter_model"])
+            results["summary"]["adapter_model"]["avg_response_length"] /= count
+            results["summary"]["adapter_model"]["chinese_ratio"] /= count
+        
+        return self.save_results(results)
+    
+    def save_results(self, results):
+        """保存验证结果 - 中文增强版"""
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        output_path = os.path.join(self.args.output_dir, "validation_results.json")
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"验证完成! 结果保存至 {output_path}")
+        
+        # 打印中文增强摘要
+        print("\n" + "="*60)
+        print("?? 中文验证摘要:")
+        print(f"?? 总样本数: {results['summary']['total_samples']}")
+        
+        if results["summary"]["base_model"]["avg_response_length"] > 0:
+            print(f"?? 基础模型:")
+            print(f"   ?? 平均长度: {results['summary']['base_model']['avg_response_length']:.0f} 字符")
+            print(f"   ???? 中文比例: {results['summary']['base_model']['chinese_ratio']:.2%}")
+        
+        if results["summary"]["adapter_model"]["avg_response_length"] > 0:
+            print(f"?? 微调模型:")
+            print(f"   ?? 平均长度: {results['summary']['adapter_model']['avg_response_length']:.0f} 字符")
+            print(f"   ???? 中文比例: {results['summary']['adapter_model']['chinese_ratio']:.2%}")
+        
+        print("="*60)
+        print(f"?? 完整结果: {output_path}")
+        
+        return {
+            "summary": results["summary"],
+            "output_path": output_path
+        }

@@ -1,0 +1,24 @@
+# -------------- 全局索引 --------------
+--extra-index-url https://download.pytorch.org/whl/cu124
+--trusted-host download.pytorch.org
+
+# -------------- PyTorch 主包 --------------
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+
+# -------------- Unsloth & 训练生态 --------------
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--trusted-host pypi.tuna.tsinghua.edu.cn
+
+unsloth==2025.6.5
+unsloth-zoo==2025.6.4
+accelerate==1.7.0
+xformers==0.0.29.post3
+triton==3.2.0
+transformers==4.52.4
+peft==0.15.2
+trl==0.12.0
+datasets==3.6.0
+evaluate
+gputil
