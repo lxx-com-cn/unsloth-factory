@@ -17,7 +17,7 @@ class ModelFactory:
     
     @classmethod
     def create_model(cls, model_path, max_seq_length, adapter_path=None, use_unsloth=True):
-        """创建模型实例 - 修复Qwen3检测"""
+        """创建模型实例 - 修复Qwen3检测并支持14B模型"""
         # 验证原始模型路径
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"基础模型路径不存在: {model_path}")
@@ -35,14 +35,41 @@ class ModelFactory:
         # 根据支持情况选择加载方式
         if supports_unsloth:
             try:
-                model, _ = FastLanguageModel.from_pretrained(
-                    model_name=model_path,
-                    max_seq_length=max_seq_length,
-                    dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                    load_in_4bit=True,
-                )
+                # 针对14B模型添加特殊处理
+                if "14b" in model_path.lower():
+                    logger.info("检测到14B大模型，应用特殊优化配置")
+                    
+                    # 使用更高效的4bit量化配置
+                    model, _ = FastLanguageModel.from_pretrained(
+                        model_name=model_path,
+                        max_seq_length=max_seq_length,
+                        dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                        load_in_4bit="bnb",
+                        token=os.environ.get("HF_TOKEN", None),
+                        # 添加大模型优化参数
+                        attn_implementation="flash_attention_2",
+                        use_gradient_checkpointing=True,
+                        # 显存优化配置
+                        device_map="auto",
+                        max_memory={0: "14GiB", "cpu": "32GiB"}  # 关键修改：显存优化
+                    )
+                else:
+                    # 标准Unsloth加载方式
+                    model, _ = FastLanguageModel.from_pretrained(
+                        model_name=model_path,
+                        max_seq_length=max_seq_length,
+                        dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                        load_in_4bit=True,
+                    )
+                
                 logger.info("使用Unsloth优化加载")
                 target_modules = cls.get_target_modules(model_type)
+                
+                # 确保应用所有必要的优化层
+                if hasattr(FastLanguageModel, 'configure_optimized_parameters'):
+                    model = FastLanguageModel.configure_optimized_parameters(model)
+                    logger.info("已应用优化层配置")
+                
                 return model, tokenizer, target_modules, True
             except Exception as e:
                 logger.warning(f"Unsloth加载失败: {str(e)}，回退到标准方式")
@@ -73,6 +100,8 @@ class ModelFactory:
             if "deepseek" in actual_path and "0528" in actual_path and "qwen3" in actual_path:
                 return "deepseek_r1_0528_qwen3"
             elif "qwen3" in actual_path or "qwen3" in model_name:
+                if "14b" in actual_path:
+                    return "qwen3_14b"  # 新增14B标识
                 return "qwen3"
             elif "deepseek" in actual_path and "qwen3" in actual_path:
                 return "deepseek_r1_qwen3"
@@ -106,7 +135,7 @@ class ModelFactory:
     
     @classmethod
     def load_base_model(cls, model_path: str, max_seq_length: int, use_unsloth: bool):
-        """加载基础模型"""
+        """加载基础模型 - 关键修改：添加CPU offload支持"""
         logger.info(f"加载基础模型: {model_path}")
         
         # 配置量化
@@ -117,15 +146,31 @@ class ModelFactory:
             bnb_4bit_use_double_quant=True,
         )
         
+        # 关键修改：添加显存优化配置
+        device_map = "auto"
+        max_memory = None
+        
+        # 针对14B模型添加特殊处理
+        if "14b" in model_path.lower():
+            logger.info("检测到14B大模型，启用CPU offload")
+            device_map = "auto"
+            max_memory = {
+                0: "14GiB",  # GPU 0分配14GB
+                "cpu": "32GiB"  # CPU分配32GB
+            }
+        
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 quantization_config=bnb_config,
-                device_map="auto",
+                device_map=device_map,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                 attn_implementation="flash_attention_2" if torch.cuda.get_device_capability()[0] >= 8 else None,
+                max_memory=max_memory,  # 关键修改
+                offload_folder="./offload",  # 关键修改
+                offload_state_dict=True  # 关键修改
             )
         
         model.config.use_cache = False
@@ -163,6 +208,7 @@ class ModelFactory:
         """根据模型类型获取目标模块"""
         module_map = {
             "qwen3": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "qwen3_14b": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "deepseek_r1_qwen": ["q_proj", "k_proj", "v_proj", "o_proj"],
             "deepseek_r1_qwen3": ["q_proj", "k_proj", "v_proj", "o_proj"],

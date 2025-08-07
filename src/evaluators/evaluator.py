@@ -4,9 +4,11 @@ import json
 import logging
 import torch
 import numpy as np
+import gc  # 关键添加
 from peft import PeftModel
 from src.evaluators.ceval_evaluator import evaluate_ceval
 from src.core.model_factory import ModelFactory
+from src.utils.helpers import log_memory_usage  # 关键添加
 
 # 配置详细日志
 logging.basicConfig(
@@ -53,6 +55,8 @@ class Evaluator:
         logger.info("评估基础模型")
         logger.info("=" * 80)
         base_model, base_tokenizer = self.load_model()
+        logger.info(f"加载基础模型后内存使用: {log_memory_usage()}")
+        
         base_results = evaluate_ceval(
             model=base_model,
             tokenizer=base_tokenizer,
@@ -63,12 +67,21 @@ class Evaluator:
         )
         results["base_model"] = base_results
         
+        # 关键修改：释放基础模型资源
+        logger.info(f"评估基础模型后内存使用: {log_memory_usage()}")
+        del base_model, base_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"释放基础模型后内存使用: {log_memory_usage()}")
+        
         # 评估微调后的模型（如果提供了适配器路径）
         if self.args.adapter:
             logger.info("=" * 80)
             logger.info("评估微调后的模型")
             logger.info("=" * 80)
             ft_model, ft_tokenizer = self.load_model(self.args.adapter)
+            logger.info(f"加载微调模型后内存使用: {log_memory_usage()}")
+            
             ft_results = evaluate_ceval(
                 model=ft_model,
                 tokenizer=ft_tokenizer,
@@ -78,6 +91,13 @@ class Evaluator:
                 save_dir=os.path.join(self.args.save_dir, "finetuned_model")
             )
             results["finetuned_model"] = ft_results
+            
+            # 关键修改：释放微调模型资源
+            logger.info(f"评估微调模型后内存使用: {log_memory_usage()}")
+            del ft_model, ft_tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(f"释放微调模型后内存使用: {log_memory_usage()}")
         
         # 保存完整的评估结果
         self.save_results(results)

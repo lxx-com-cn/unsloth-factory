@@ -5,6 +5,7 @@ import logging
 import torch
 import re
 import random
+import gc  # 关键添加
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from peft import PeftModel
@@ -13,7 +14,8 @@ from src.core.dataset_factory import DatasetFactory
 from src.utils.helpers import (
     setup_logging,
     validate_domain_response,
-    clean_response
+    clean_response,
+    log_memory_usage  # 关键添加
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,7 @@ class ModelValidator:
         """执行验证 - 修复CLI报错"""
         # 加载基础模型
         base_model, base_tokenizer = self.load_model()
+        base_model.eval()
         
         # 加载数据集
         dataset = self.load_dataset()
@@ -125,7 +128,6 @@ class ModelValidator:
         }
         
         # 验证基础模型
-        base_model.eval()
         with torch.no_grad():
             for sample in tqdm(samples, desc="验证基础模型"):
                 text = sample["text"]
@@ -138,6 +140,13 @@ class ModelValidator:
                     "expected_output": text.split("<|assistant|>")[-1].replace("</s>", "").strip(),
                     "model_response": response,
                 })
+        
+        # 关键修改：释放基础模型资源
+        logger.info(f"验证基础模型后内存使用: {log_memory_usage()}")
+        del base_model, base_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"释放基础模型后内存使用: {log_memory_usage()}")
         
         # 验证适配器模型（如果提供）
         if self.args.adapter:
@@ -155,6 +164,13 @@ class ModelValidator:
                         "expected_output": text.split("<|assistant|>")[-1].replace("</s>", "").strip(),
                         "model_response": response,
                     })
+            
+            # 关键修改：释放适配器模型资源
+            logger.info(f"验证微调模型后内存使用: {log_memory_usage()}")
+            del adapter_model, adapter_tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(f"释放微调模型后内存使用: {log_memory_usage()}")
         
         # 计算统计信息
         return self.save_results(results)
