@@ -68,7 +68,7 @@ class ChatSystem:
         )
 
         if hasattr(self.args, 'adapter') and self.args.adapter and os.path.exists(self.args.adapter):
-            from peft import PeftModel  # ✅ 修复：原来是 peef
+            from peft import PeftModel
             self.model = PeftModel.from_pretrained(self.model, self.args.adapter, is_trainable=False)
             self.model = self.model.merge_and_unload()
             logger.info("适配器已合并")
@@ -78,7 +78,7 @@ class ChatSystem:
 
     def build_messages(self, user_input: str) -> List[Dict[str, str]]:
         messages = []
-        system_prompt = getattr(self.args, 'system', '') or "你是一个专业的医疗助手，请用中文回答"
+        system_prompt = getattr(self.args, 'system', '') or "你是一个专业的医疗助手"
         messages.append({"role": "system", "content": system_prompt})
 
         if not getattr(self.args, 'no_context', False) and self.history:
@@ -142,18 +142,16 @@ class ChatSystem:
                 torch.cuda.empty_cache()
 
     def _stream_generate(self, prompt: str):
-        """逐字符流式生成 - 核心实现"""
+        """确保 max_new_tokens 不被输入长度压缩"""
+        max_new_tokens = getattr(self.args, 'max_new_tokens', 8192)  # 默认 8192
+        max_input_len = getattr(self.args, 'max_seq_length', 8192) - max_new_tokens
+
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=getattr(self.args, 'max_seq_length', 8192)
+            max_length=max_input_len  # 只截断输入，保留输出空间
         ).to(self.model.device)
-
-        max_new_tokens = min(
-            getattr(self.args, 'max_new_tokens', 2048),
-            8192 - inputs['input_ids'].shape[1]
-        )
 
         streamer = TextIteratorStreamer(
             self.tokenizer,
@@ -173,11 +171,9 @@ class ChatSystem:
             "streamer": streamer
         }
 
-        # 启动生成线程
         thread = Thread(target=self.model.generate, kwargs=gen_kwargs)
         thread.start()
 
-        # 状态管理
         buffer = ""
         in_think = False
         think_complete = False
@@ -188,10 +184,8 @@ class ChatSystem:
         for token in streamer:
             if not token:
                 continue
-
             buffer += token
 
-            # 实时检测思维链
             if getattr(self.args, 'think_chain', False):
                 if not in_think and "<think>" in buffer:
                     in_think = True
@@ -210,16 +204,12 @@ class ChatSystem:
                     continue
 
                 if in_think:
-                    # 逐字符输出思维链
                     print(token, end="", flush=True)
                 elif think_complete or "<think>" not in buffer:
-                    # 逐字符输出正式回答
                     print(token, end="", flush=True)
             else:
-                # 直接逐字符输出
                 print(token, end="", flush=True)
 
-        # 收集完整响应用于历史
         full_response = buffer
         if not getattr(self.args, 'no_context', False):
             self.history.append(("user", "用户输入"))
