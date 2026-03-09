@@ -1,8 +1,7 @@
-# -------------- 全局索引 --------------
+# -------------- PyTorch CUDA 12.4 主包 --------------
 --extra-index-url https://download.pytorch.org/whl/cu124
 --trusted-host download.pytorch.org
 
-# -------------- PyTorch 主包 --------------
 torch==2.6.0+cu124
 torchvision==0.21.0+cu124
 torchaudio==2.6.0+cu124
@@ -11,8 +10,8 @@ torchaudio==2.6.0+cu124
 --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 --trusted-host pypi.tuna.tsinghua.edu.cn
 
-unsloth==2025.6.5
-unsloth-zoo==2025.6.4
+unsloth==2025.10.6
+unsloth-zoo==2025.10.6
 accelerate==1.7.0
 xformers==0.0.29.post3
 triton==3.2.0
@@ -20,5 +19,106 @@ transformers==4.52.4
 peft==0.15.2
 trl==0.12.0
 datasets==3.6.0
-evaluate
-gputil
+cut-cross-entropy==25.1.1
+hf-transfer==0.1.9
+hf-xet==1.2.0
+sentencepiece==0.2.1
+tiktoken==0.12.0
+bitsandbytes==0.49.1
+diffusers==0.36.0
+mistral-common==1.9.1
+
+# -------------- Web 服务 & API --------------
+fastapi==0.135.1
+uvicorn==0.41.0
+starlette==0.52.1
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.12.1
+click==8.3.1
+pydantic==2.12.5
+pydantic-core==2.41.5
+pydantic-extra-types==2.11.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+annotated-types==0.7.0
+annotated-doc==0.0.4
+tyro==1.0.6
+docstring-parser==0.17.0
+typeguard==4.4.4
+rich==14.3.2
+pygments==2.19.2
+markdown-it-py==4.0.0
+mdurl==0.1.2
+
+# -------------- 数据处理 & 工具 --------------
+numpy==2.3.5
+pandas==3.0.0
+pyarrow==23.0.0
+dill==0.3.8
+multiprocess==0.70.16
+xxhash==3.6.0
+fsspec==2025.3.0
+aiohttp==3.13.3
+aiohappyeyeballs==2.6.1
+aiosignal==1.4.0
+multidict==6.7.1
+yarl==1.22.0
+frozenlist==1.8.0
+propcache==0.4.1
+async-timeout==5.0.1
+attrs==25.4.0
+
+# -------------- 模型推理优化 --------------
+safetensors==0.7.0
+tokenizers==0.21.4
+regex==2026.1.15
+jinja2==3.1.6
+markupsafe==2.1.5
+filelock==3.20.0
+huggingface-hub==0.36.2
+requests==2.32.5
+urllib3==2.6.3
+certifi==2026.1.4
+charset-normalizer==3.4.4
+idna==3.11
+
+# -------------- 中文处理 & 评估 --------------
+jieba==0.42.1
+scikit-learn==1.8.0
+scipy==1.17.0
+joblib==1.5.3
+threadpoolctl==3.6.0
+evaluate==0.4.6
+tqdm==4.67.3
+pycountry==24.6.1
+
+# -------------- 数学 & 网络 --------------
+sympy==1.13.1
+mpmath==1.3.0
+networkx==3.6.1
+protobuf==6.33.5
+msgspec==0.20.0
+importlib-metadata==8.7.1
+zipp==3.23.0
+
+# -------------- 图像处理 --------------
+pillow==12.0.0
+
+# -------------- GPU 监控 --------------
+gputil==1.4.0
+psutil==7.2.2
+
+# -------------- JSON 处理 --------------
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==0.30.0
+pyyaml==6.0.3
+six==1.17.0
+python-dateutil==2.9.0.post0
+tzdata==2025c
+
+# -------------- 可选：torchao（有警告但可用）--------------
+torchao==0.16.0

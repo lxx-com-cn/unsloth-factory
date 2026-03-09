@@ -1,0 +1,17 @@
+{
+  "domain": "medical",
+  "description": "自动生成的medical领域知识库",
+  "domain_categories": {
+    "disease_categories": "疾病分类",
+    "symptoms": "症状"
+  },
+  "file_structure": {
+    "disease_categories": [
+      "diseases.json"
+    ],
+    "general_files": [
+      "medical_terms.json",
+      "medical_advice.json"
+    ]
+  }
+}

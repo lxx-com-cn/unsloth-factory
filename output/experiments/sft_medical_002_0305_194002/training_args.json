@@ -1,0 +1,31 @@
+{
+  "command": "sft",
+  "dataset_format": "alpaca",
+  "output_dir": "output/sft-qwen3-14b",
+  "epochs": 3,
+  "max_seq_length": 4096,
+  "batch_size": 1,
+  "accumulation_steps": 2,
+  "learning_rate": 3e-05,
+  "data_limit": 4000,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "lr_scheduler_type": "cosine",
+  "save_steps": 100,
+  "logging_steps": 10,
+  "no_packing": true,
+  "dataloader_workers": 4,
+  "resume": null,
+  "domain": "medical",
+  "mixing_strategy": "weighted",
+  "dataset_weights": "0.2,0.2,0.3,0.3",
+  "experiments_root": "output/experiments",
+  "experiment_id": null,
+  "weights": [
+    0.2,
+    0.2,
+    0.3,
+    0.3
+  ]
+}

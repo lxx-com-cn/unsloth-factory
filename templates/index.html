@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能医疗助手</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .chat-container {
+            width: 90%;
+            max-width: 800px;
+            height: 90vh;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .chat-header {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .chat-header h1 { font-size: 24px; margin-bottom: 5px; }
+        .chat-header p { font-size: 14px; opacity: 0.9; }
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+        .message {
+            margin-bottom: 15px;
+            max-width: 80%;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .message.user { margin-left: auto; }
+        .message.assistant { margin-right: auto; }
+        .message-content {
+            padding: 12px 16px;
+            border-radius: 18px;
+            line-height: 1.6;
+            word-wrap: break-word;
+        }
+        .message.user .message-content {
+            background: #667eea;
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        .message.assistant .message-content {
+            background: white;
+            color: #333;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .think-content {
+            background: #f5f5f5 !important;
+            color: #666 !important;
+            font-size: 13px;
+            border-left: 3px solid #667eea;
+            margin-bottom: 8px;
+            font-style: italic;
+        }
+        .answer-content {
+            background: white !important;
+            color: #000 !important;
+            font-weight: 500;
+        }
+        .chat-input {
+            display: flex;
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+        }
+        .chat-input input {
+            flex: 1;
+            padding: 12px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        .chat-input input:focus { border-color: #667eea; }
+        .chat-input button {
+            margin-left: 10px;
+            padding: 12px 24px;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .chat-input button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+        .chat-input button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .typing-indicator {
+            display: none;
+            padding: 12px 16px;
+            background: white;
+            border-radius: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 15px;
+        }
+        .typing-indicator.active { display: block; }
+        .dots { display: flex; gap: 4px; }
+        .dot {
+            width: 8px;
+            height: 8px;
+            background: #999;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+        .dot:nth-child(1) { animation-delay: -0.32s; }
+        .dot:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+        .settings {
+            padding: 10px 20px;
+            background: #f8f9fa;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            font-size: 14px;
+        }
+        .settings label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+        .settings input[type="checkbox"] { cursor: pointer; }
+        .error-message {
+            background: #fee !important;
+            color: #c33 !important;
+            border-left-color: #c33 !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1>智能医疗助手</h1>
+            <p>基于 Qwen3-14B 医学大模型 | 支持思维链推理</p>
+        </div>
+
+        <div class="chat-messages" id="messages">
+            <div class="message assistant">
+                <div class="message-content">
+                    您好！我是智能医疗助手，可以为您解答医学健康问题。<br>
+                    我会先进行专业分析思考，然后给出详细建议。
+                </div>
+            </div>
+        </div>
+
+        <div class="typing-indicator" id="typing">
+            <div class="dots">
+                <div class="dot"></div>
+                <div class="dot"></div>
+                <div class="dot"></div>
+            </div>
+        </div>
+
+        <div class="settings">
+            <label>
+                <input type="checkbox" id="thinkChain" checked>
+                <span>显示思维链</span>
+            </label>
+            <label>
+                <input type="checkbox" id="streamOutput" checked>
+                <span>流式输出</span>
+            </label>
+            <span id="status" style="margin-left: auto; color: #666;">就绪</span>
+        </div>
+
+        <div class="chat-input">
+            <input type="text" id="userInput" placeholder="请输入您的医学问题..." autocomplete="off">
+            <button id="sendBtn" onclick="sendMessage()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        const messagesDiv = document.getElementById('messages');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const typing = document.getElementById('typing');
+        const status = document.getElementById('status');
+        const thinkChainCheck = document.getElementById('thinkChain');
+        const streamCheck = document.getElementById('streamOutput');
+
+        let sessionId = generateId();
+        let isProcessing = false;
+
+        function generateId() {
+            return 'session_' + Math.random().toString(36).substr(2, 9);
+        }
+
+        function addMessage(role, content, isThink = false, isAnswer = false) {
+            const div = document.createElement('div');
+            div.className = 'message ' + role;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            if (isThink) contentDiv.classList.add('think-content');
+            if (isAnswer) contentDiv.classList.add('answer-content');
+            contentDiv.innerHTML = content;
+
+            div.appendChild(contentDiv);
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            return contentDiv;
+        }
+
+        function updateStatus(text) {
+            status.textContent = text;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text || isProcessing) return;
+
+            addMessage('user', text);
+            userInput.value = '';
+            isProcessing = true;
+            sendBtn.disabled = true;
+            typing.classList.add('active');
+            updateStatus('思考中...');
+
+            const showThink = thinkChainCheck.checked;
+            const useStream = streamCheck.checked;
+
+            try {
+                if (useStream) {
+                    await streamRequest(text, showThink);
+                } else {
+                    await normalRequest(text, showThink);
+                }
+            } catch (err) {
+                console.error('请求失败:', err);
+                addMessage('assistant', '[连接失败: ' + err.message + ']', true).classList.add('error-message');
+            } finally {
+                isProcessing = false;
+                sendBtn.disabled = false;
+                typing.classList.remove('active');
+                updateStatus('就绪');
+                userInput.focus();
+            }
+        }
+
+        async function streamRequest(text, showThink) {
+            console.log('开始流式请求:', text);
+            
+            const response = await fetch('/v1/chat/completions', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    messages: [{role: 'user', content: text}],
+                    stream: true,
+                    think_chain: true,
+                    session_id: sessionId,
+                    max_tokens: 4096
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+            
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            
+            let thinkDiv = null;
+            let answerDiv = null;
+            let thinkContent = '';
+            let answerContent = '';
+            let hasThinkStarted = false;
+            let hasAnswerStarted = false;
+            let buffer = '';
+            
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                
+                const chunk = decoder.decode(value, {stream: true});
+                buffer += chunk;
+                
+                // 使用正则分割行，兼容 \r\n 和 \n
+                const lines = buffer.split(/\r?\n/);
+                buffer = lines.pop() || '';
+                
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    if (!line.startsWith('data: ')) continue;
+                    
+                    const dataStr = line.slice(6).trim();
+                    if (dataStr === '[DONE]') continue;
+                    
+                    try {
+                        const json = JSON.parse(dataStr);
+                        const delta = json.choices?.[0]?.delta || {};
+                        
+                        if (delta.think_token !== undefined) {
+                            thinkContent += delta.think_token;
+                            if (showThink) {
+                                if (!hasThinkStarted) {
+                                    thinkDiv = addMessage('assistant', '', true, false);
+                                    hasThinkStarted = true;
+                                }
+                                thinkDiv.innerHTML = '[思考] ' + thinkContent;
+                                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                            }
+                        } else if (delta.content !== undefined) {
+                            answerContent += delta.content;
+                            if (!hasAnswerStarted) {
+                                answerDiv = addMessage('assistant', '', false, true);
+                                hasAnswerStarted = true;
+                            }
+                            answerDiv.innerHTML = answerContent.replace(/\n/g, '<br>');
+                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        }
+                    } catch (e) {
+                        console.error('解析JSON失败:', e, '数据:', dataStr);
+                    }
+                }
+            }
+            
+            // 处理剩余buffer
+            if (buffer.trim() && buffer.startsWith('data: ')) {
+                const dataStr = buffer.slice(6).trim();
+                if (dataStr !== '[DONE]') {
+                    try {
+                        const json = JSON.parse(dataStr);
+                        const delta = json.choices?.[0]?.delta || {};
+                        if (delta.content !== undefined) {
+                            answerContent += delta.content;
+                            if (!hasAnswerStarted) {
+                                answerDiv = addMessage('assistant', '', false, true);
+                                hasAnswerStarted = true;
+                            }
+                            answerDiv.innerHTML = answerContent.replace(/\n/g, '<br>');
+                        }
+                    } catch (e) {
+                        console.error('解析剩余buffer失败:', e);
+                    }
+                }
+            }
+            
+            console.log('流式请求完成. 思考长度:', thinkContent.length, '回答长度:', answerContent.length);
+            
+            if (!hasThinkStarted && !hasAnswerStarted) {
+                addMessage('assistant', '[未收到任何响应]', false, true).classList.add('error-message');
+            }
+        }
+
+        async function normalRequest(text, showThink) {
+            console.log('开始非流式请求:', text);
+            
+            const response = await fetch('/v1/chat/completions', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    messages: [{role: 'user', content: text}],
+                    stream: false,
+                    think_chain: true,
+                    session_id: sessionId,
+                    max_tokens: 4096
+                })
+            });
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            const data = await response.json();
+            console.log('收到非流式响应:', data);
+            
+            const content = data.choices?.[0]?.message?.content || '[无响应]';
+            const think = data.think_content || '';
+
+            if (showThink && think) {
+                addMessage('assistant', '[思考] ' + think, true, false);
+            }
+            addMessage('assistant', content, false, true);
+        }
+
+        userInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        userInput.focus();
+
+        setInterval(async () => {
+            try {
+                const resp = await fetch('/health');
+                const data = await resp.json();
+                if (!data.model_loaded) updateStatus('模型加载中...');
+            } catch (e) {
+                updateStatus('服务断开');
+            }
+        }, 30000);
+    </script>
+</body>
+</html>

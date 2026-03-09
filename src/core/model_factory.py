@@ -1,4 +1,4 @@
-# src/core/model_factory.py
+# src/core/model_factory.py - 最终修复版本
 import os
 import json
 import logging
@@ -6,48 +6,72 @@ import warnings
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
-import unsloth
-from unsloth import FastLanguageModel
 
 logger = logging.getLogger(__name__)
 
+# 全局变量，用于延迟导入
+_unsloth_module = None
+_fast_language_model = None
+
+def _get_unsloth():
+    """延迟导入 Unsloth，避免不必要的 patch"""
+    global _unsloth_module, _fast_language_model
+    if _unsloth_module is None:
+        try:
+            import unsloth as _unsloth
+            from unsloth import FastLanguageModel as _flm
+            _fast_language_model = _flm
+            logger.info("Unsloth 延迟导入成功")
+        except ImportError as e:
+            logger.warning(f"Unsloth 导入失败: {e}")
+            _unsloth_module = False
+    return _fast_language_model
+
+
 class ModelFactory:
-    """创建和管理大语言模型实例的工厂类 - 修复Qwen3检测和性能问题"""
+    """创建和管理大语言模型实例的工厂类"""
 
     @classmethod
     def create_model(cls, model_path, max_seq_length, adapter_path=None, use_unsloth=True):
-        """创建模型实例 - 修复Qwen3检测并支持14B模型"""
-        # 验证原始模型路径
+        """创建模型实例 - 修复Qwen3延迟导入问题"""
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"基础模型路径不存在: {model_path}")
 
-        # 检测模型类型（修复检测逻辑）
         model_type = cls.detect_model_type(model_path)
         logger.info(f"检测到模型类型: {model_type}")
 
-        # 检查Unsloth兼容性 - 添加对deepseek-r1-qwen3的特殊处理
+        # 检查Unsloth兼容性
         supports_unsloth = cls.check_unsloth_support(model_type) and use_unsloth
+        
+        # Qwen3 特殊处理：不导入 Unsloth，避免 patch
+        if "qwen3" in model_type.lower():
+            logger.info(f"检测到 {model_type}，使用标准Transformers（避免Unsloth patch）")
+            supports_unsloth = False
 
-        # 始终使用原始tokenizer
+        # 只在需要时导入 Unsloth
+        FastLanguageModel = None
+        if supports_unsloth:
+            FastLanguageModel = _get_unsloth()
+            if FastLanguageModel is None:
+                logger.warning("Unsloth 不可用，回退到标准方式")
+                supports_unsloth = False
+
         tokenizer = cls.load_tokenizer(model_path)
 
         # 根据支持情况选择加载方式
-        if supports_unsloth:
+        if supports_unsloth and FastLanguageModel is not None:
             try:
-                # 针对14B模型添加特殊处理 - 仅用于微调(SFT)，不添加显存优化参数
+                # 针对14B模型添加特殊处理
                 if "14b" in model_path.lower():
                     logger.info("检测到14B大模型，应用特殊优化配置 (SFT模式)")
-                    # 微调时使用Unsloth默认加载，不传max_memory等参数
                     model, _ = FastLanguageModel.from_pretrained(
                         model_name=model_path,
                         max_seq_length=max_seq_length,
                         dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                        load_in_4bit=True, # 保持4bit量化
+                        load_in_4bit=True,
                         token=os.environ.get("HF_TOKEN", None),
-                        # 注意：移除了可能导致冲突的显存优化参数
                     )
                 else:
-                    # 其他支持Unsloth的模型使用标准加载
                     model, _ = FastLanguageModel.from_pretrained(
                         model_name=model_path,
                         max_seq_length=max_seq_length,
@@ -57,25 +81,33 @@ class ModelFactory:
                     )
                 logger.info("使用Unsloth优化加载")
                 target_modules = cls.get_target_modules(model_type)
-                # 确保应用所有必要的优化层
+                
+                # 应用优化层配置（如果可用）
                 if hasattr(FastLanguageModel, 'configure_optimized_parameters'):
                     model = FastLanguageModel.configure_optimized_parameters(model)
-                logger.info("已应用优化层配置")
-                # 合并适配器（如果提供了路径且用于非训练场景，如chat/eval）
+                    logger.info("已应用优化层配置")
+                
+                # 合并适配器（如果提供了路径且用于非训练场景）
                 if adapter_path:
                     model = cls.merge_adapter(model, adapter_path)
                 return model, tokenizer, target_modules, True
+                
             except Exception as e:
                 logger.warning(f"Unsloth加载失败: {str(e)}，回退到标准方式")
-                supports_unsloth = False
+                # 清理已导入的模块，避免残留影响
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
 
         # 标准加载方式（回退 或 use_unsloth=False）
-        model = cls.load_base_model(model_path, max_seq_length, supports_unsloth=False) # 显式传False
+        logger.info("使用标准Transformers加载方式")
+        model = cls.load_base_model(model_path, max_seq_length)
+        
         # 合并适配器（如果提供了路径）
         if adapter_path:
             model = cls.merge_adapter(model, adapter_path)
         target_modules = cls.get_target_modules(model_type)
-        return model, tokenizer, target_modules, supports_unsloth
+        return model, tokenizer, target_modules, False
 
     @classmethod
     def detect_model_type(cls, model_path: str) -> str:
@@ -87,7 +119,6 @@ class ModelFactory:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
             model_name = config.get("_name_or_path", "").lower()
-            # 修复检测逻辑，优先检查路径
             actual_path = model_path.lower()
 
             # 添加对 deepseek-r1-0528-qwen3 的特殊检测
@@ -95,7 +126,7 @@ class ModelFactory:
                 return "deepseek_r1_0528_qwen3"
             elif "qwen3" in actual_path or "qwen3" in model_name:
                 if "14b" in actual_path:
-                    return "qwen3_14b" # 新增14B标识
+                    return "qwen3_14b"
                 return "qwen3"
             elif "deepseek" in actual_path and "qwen3" in actual_path:
                 return "deepseek_r1_qwen3"
@@ -118,16 +149,15 @@ class ModelFactory:
             trust_remote_code=True,
             padding_side="right"
         )
-        # 确保有pad_token
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
 
     @classmethod
-    def load_base_model(cls, model_path: str, max_seq_length: int, supports_unsloth: bool):
-        """加载基础模型 - 关键修改：添加CPU offload支持"""
+    def load_base_model(cls, model_path: str, max_seq_length: int):
+        """加载基础模型 - 添加CPU offload支持"""
         logger.info(f"加载基础模型: {model_path}")
-        # 配置量化
+        
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -135,13 +165,12 @@ class ModelFactory:
             bnb_4bit_use_double_quant=True,
         )
 
-        # 关键修改：添加显存优化配置 - 仅在非Unsloth模式下应用
         device_map = "auto"
         max_memory = None
-        # 针对14B模型添加特殊处理 - 用于评估/验证/聊天
+        
+        # 针对14B模型添加特殊处理
         if "14b" in model_path.lower():
-            logger.info("检测到14B大模型，启用CPU offload (非SFT模式)")
-            # 根据实际情况调整分配
+            logger.info("检测到14B大模型，启用CPU offload")
             max_memory = {0: "14GiB", "cpu": "32GiB"}
 
         with warnings.catch_warnings():
@@ -150,7 +179,7 @@ class ModelFactory:
                 model_path,
                 quantization_config=bnb_config,
                 device_map=device_map,
-                max_memory=max_memory, # 仅在此模式下使用
+                max_memory=max_memory,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
             )
@@ -176,8 +205,8 @@ class ModelFactory:
     @classmethod
     def check_unsloth_support(cls, model_type: str) -> bool:
         """检查模型是否支持Unsloth"""
-        # 明确排除 deepseek-r1-0528-qwen3 和 deepseek-r1-qwen3
-        unsupported = ["deepseek_r1_0528_qwen3", "deepseek_r1_qwen3", "deepseek_r1_qwen"]
+        # 明确排除 qwen3 系列
+        unsupported = ["qwen3", "qwen3_14b", "deepseek_r1_0528_qwen3", "deepseek_r1_qwen3", "deepseek_r1_qwen"]
         return model_type not in unsupported
 
     @classmethod
@@ -185,7 +214,7 @@ class ModelFactory:
         """获取模型对应的LoRA目标模块"""
         module_map = {
             "qwen3": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            "qwen3_14b": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], # 14B使用相同模块
+            "qwen3_14b": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "deepseek_r1_qwen": ["q_proj", "k_proj", "v_proj", "o_proj"],
             "deepseek_r1_qwen3": ["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -193,8 +222,3 @@ class ModelFactory:
             "unknown": ["q_proj", "k_proj", "v_proj", "o_proj"]
         }
         return module_map.get(model_type, module_map["unknown"])
-
-# 警告提示
-import transformers, peft
-if not hasattr(transformers, "models") or not hasattr(peft, "tuners"):
-    logger.warning("WARNING: Unsloth should be imported before transformers, peft to ensure all optimizations are applied. Your code may run slower or encounter memory issues without these optimizations. Please restructure your imports with 'import unsloth' at the top of your file.")

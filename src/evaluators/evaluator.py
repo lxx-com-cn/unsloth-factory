@@ -3,51 +3,42 @@ import os
 import json
 import logging
 import torch
-import numpy as np
-import gc  # 关键添加
+import gc
+from typing import Dict, Any, Optional
 from peft import PeftModel
 from src.evaluators.ceval_evaluator import evaluate_ceval
 from src.core.model_factory import ModelFactory
-from src.utils.helpers import log_memory_usage  # 关键添加
+from src.utils.helpers import log_memory_usage
 
-# 配置详细日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("evaluation_debug.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 class Evaluator:
+    """模型评估器，支持多种评测任务"""
+    
     def __init__(self, args):
         self.args = args
+        self.task = args.task
     
-    def load_model(self, adapter_path=None):
-        """加载模型，始终使用原始tokenizer"""
+    def load_model(self, adapter_path: Optional[str] = None):
+        """加载模型（始终使用原始 tokenizer）"""
         logger.info(f"加载基础模型: {self.args.model}")
-        
-        # 使用ModelFactory加载模型，确保使用原始tokenizer
         model, tokenizer, _, _ = ModelFactory.create_model(
             model_path=self.args.model,
             max_seq_length=self.args.max_seq_length,
-            adapter_path=adapter_path,  # 传递适配器路径
+            adapter_path=adapter_path,
             use_unsloth=False
         )
-        
         return model, tokenizer
     
-    def evaluate(self):
-        """执行评估"""
-        if self.args.task == "ceval":
-            return self.evaluate_ceval()
+    def evaluate(self) -> Dict[str, Any]:
+        """执行指定任务的评估"""
+        if self.task == "ceval":
+            return self._evaluate_ceval()
         else:
-            raise ValueError(f"不支持的评估任务: {self.args.task}")
+            raise ValueError(f"不支持的任务: {self.task}")
     
-    def evaluate_ceval(self):
-        """评估C-Eval任务"""
+    def _evaluate_ceval(self) -> Dict[str, Any]:
+        """C-Eval 评估"""
         results = {}
         
         # 评估基础模型
@@ -63,21 +54,25 @@ class Evaluator:
             task_dir=self.args.task_dir,
             n_shot=self.args.n_shot,
             lang=self.args.lang,
-            save_dir=os.path.join(self.args.save_dir, "base_model")
+            save_dir=os.path.join(self.args.save_dir, "base_model"),
+            temperature=self.args.temperature,
+            top_p=self.args.top_p,
+            top_k=self.args.top_k,
+            max_new_tokens=self.args.max_new_tokens,
         )
         results["base_model"] = base_results
         
-        # 关键修改：释放基础模型资源
+        # 释放基础模型资源
         logger.info(f"评估基础模型后内存使用: {log_memory_usage()}")
         del base_model, base_tokenizer
         gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"释放基础模型后内存使用: {log_memory_usage()}")
         
-        # 评估微调后的模型（如果提供了适配器路径）
+        # 评估微调模型（如果提供了适配器）
         if self.args.adapter:
             logger.info("=" * 80)
-            logger.info("评估微调后的模型")
+            logger.info("评估微调模型")
             logger.info("=" * 80)
             ft_model, ft_tokenizer = self.load_model(self.args.adapter)
             logger.info(f"加载微调模型后内存使用: {log_memory_usage()}")
@@ -88,22 +83,26 @@ class Evaluator:
                 task_dir=self.args.task_dir,
                 n_shot=self.args.n_shot,
                 lang=self.args.lang,
-                save_dir=os.path.join(self.args.save_dir, "finetuned_model")
+                save_dir=os.path.join(self.args.save_dir, "finetuned_model"),
+                temperature=self.args.temperature,
+                top_p=self.args.top_p,
+                top_k=self.args.top_k,
+                max_new_tokens=self.args.max_new_tokens,
             )
             results["finetuned_model"] = ft_results
             
-            # 关键修改：释放微调模型资源
+            # 释放微调模型资源
             logger.info(f"评估微调模型后内存使用: {log_memory_usage()}")
             del ft_model, ft_tokenizer
             gc.collect()
             torch.cuda.empty_cache()
             logger.info(f"释放微调模型后内存使用: {log_memory_usage()}")
         
-        # 保存完整的评估结果
-        self.save_results(results)
+        # 保存完整评估结果并生成对比报告
+        self._save_results(results)
         return results
     
-    def save_results(self, results):
+    def _save_results(self, results: Dict[str, Any]):
         """保存评估结果并生成对比报告"""
         os.makedirs(self.args.save_dir, exist_ok=True)
         
@@ -171,12 +170,10 @@ class Evaluator:
         logger.info(f"评估结果保存至: {result_path}")
         logger.info(f"对比报告保存至: {comparison_path}")
         
-        # 打印对比报告
-        self.print_comparison(results)
-        
-        return results
+        # 打印简要对比
+        self._print_comparison(results)
     
-    def print_comparison(self, results):
+    def _print_comparison(self, results: Dict[str, Any]):
         """打印对比报告"""
         print("\n" + "="*80)
         print("评估对比摘要:")

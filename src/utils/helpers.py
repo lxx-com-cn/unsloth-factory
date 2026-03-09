@@ -1,4 +1,5 @@
-# src/utils/helpers.py
+# src/utils/helpers.py - 优化资源监控函数
+
 import os
 import re
 import logging
@@ -13,6 +14,60 @@ from src.knowledge import get_knowledge_base  # 导入知识库接口
 
 # 设置模块级 logger
 logger = logging.getLogger(__name__)
+
+def get_gpu_memory_usage():
+    """获取GPU显存使用情况"""
+    try:
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)    # GB
+            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+            available = total - allocated
+            
+            return {
+                'allocated_gb': round(allocated, 2),
+                'reserved_gb': round(reserved, 2),
+                'total_gb': round(total, 2),
+                'available_gb': round(available, 2),
+                'utilization_percent': round((allocated / total) * 100, 1)
+            }
+    except Exception as e:
+        logger.error(f"获取GPU显存失败: {e}")
+    return {'allocated_gb': 0, 'reserved_gb': 0, 'total_gb': 0, 'available_gb': 0, 'utilization_percent': 0}
+
+def check_system_resources():
+    """检查系统资源"""
+    # CPU使用率
+    cpu_percent = psutil.cpu_percent(interval=1)
+    
+    # 内存使用
+    memory = psutil.virtual_memory()
+    memory_used_gb = memory.used / (1024**3)
+    memory_total_gb = memory.total / (1024**3)
+    
+    # GPU使用
+    gpu_info = get_gpu_memory_usage()
+    
+    return {
+        'cpu_percent': cpu_percent,
+        'memory_used_gb': round(memory_used_gb, 2),
+        'memory_total_gb': round(memory_total_gb, 2),
+        'memory_percent': memory.percent,
+        'gpu_memory': gpu_info
+    }
+
+def can_handle_concurrent_request(current_concurrent=0):
+    """检查是否可以处理并发请求 - 修复并发限制"""
+    resources = check_system_resources()
+    gpu_available = resources['gpu_memory']['available_gb']
+    gpu_utilization = resources['gpu_memory']['utilization_percent']
+    
+    # 更宽松的并发条件：只要有2GB可用显存且利用率低于85%就可以处理并发
+    can_handle = gpu_available >= 2.0 and gpu_utilization < 85
+    
+    logger.info(f"并发检查: 当前并发={current_concurrent}, 可用显存={gpu_available}GB, GPU利用率={gpu_utilization}%, 可处理={can_handle}")
+    
+    return can_handle
 
 def extract_answer_letter(text):
     """从文本中提取选择题答案字母（增强版）"""
@@ -304,57 +359,93 @@ def validate_domain_response(response, question, domain="medical"):
     if not question or not isinstance(question, str):
         return response
     
-    # 获取领域知识库
-    knowledge_base, term_map, get_advice = get_knowledge_base(domain)
-    
     try:
-        # 关键错误检查
-        for condition, terms in knowledge_base.items():
-            if condition in question:
-                for term in terms:
-                    if term not in response:
-                        logger.warning(f"可能遗漏领域术语: {term}")
+        # 获取领域知识库
+        knowledge_base, term_map, get_advice = get_knowledge_base(domain)
         
-        # 领域特定错误修正
-        if domain == "medical":
-            error_corrections = [
-                (r"闭经.*子宫内膜癌", "需排除妊娠后再评估", "闭经直接诊断为子宫内膜癌"),
-                (r"麻疹.*(扁桃体炎|痄腮)", "麻疹", "麻疹误诊为扁桃体炎或痄腮"),
-                (r"胃肠穿孔.*胰腺炎", "胃肠穿孔", "胃肠穿孔误诊为胰腺炎"),
-                (r"霍奇金病.*(白血病|淋巴瘤)", "霍奇金淋巴瘤", "霍奇金病与其他淋巴瘤混淆"),
-                (r"脑卒中.*自行用药", "立即就医，不要自行用药", "脑卒中自行用药风险"),
-                (r"心肌梗死.*阿司匹林", "立即就医，不要自行用药", "心梗自行用药风险"),
-                (r"中毒.*催吐", "不要自行催吐", "中毒自行催吐风险"),
-            ]
-        elif domain == "legal":
-            error_corrections = [
-                (r"口头协议.*证据效力", "书面合同具有更高证据效力", "忽视书面证据风险"),
-                (r"知识产权.*自行维权", "建议委托专业律师", "自行维权风险"),
-                (r"刑事.*自首", "自首可以从轻或减轻处罚", "未提及自首法律效果"),
-            ]
-        elif domain == "psychology":
-            error_corrections = [
-                (r"抑郁.*自行停药", "不要自行停药，遵医嘱", "自行停药风险"),
-                (r"自杀意念.*保密", "有伤害自己或他人风险时应突破保密原则", "保密原则误解"),
-            ]
-        elif domain == "exam":
-            error_corrections = [
-                (r"数学题.*近似值", "使用精确计算", "考试中不应使用近似值"),
-                (r"作文.*抄袭", "原创内容得分更高", "抄袭风险"),
-            ]
-        else:
-            error_corrections = []
+        # 应用术语替换
+        for eng, chn in term_map.items():
+            response = response.replace(eng, chn)
+            question = question.replace(eng, chn)
         
-        # 应用修正
-        for pattern, replacement, warning in error_corrections:
-            if re.search(pattern, question) and re.search(pattern, response):
-                logger.warning(f"检测到可能的领域错误: {warning}")
-                response = re.sub(pattern, replacement, response)
+        # 应用领域特定建议
+        response = get_advice(question, response)
+        
     except Exception as e:
-        logger.error(f"领域验证失败: {str(e)}")
+        logger.warning(f"知识库处理失败: {str(e)}，使用基础验证")
+        response = _basic_domain_validation(response, question, domain)
+    
+    # 应用领域特定的错误修正
+    try:
+        response = _apply_domain_error_corrections(response, question, domain)
+    except Exception as e:
+        logger.error(f"领域错误修正失败: {str(e)}")
     
     return response
 
+
+def _basic_domain_validation(response, question, domain):
+    """基础领域验证（当知识库不可用时使用）"""
+    # 基础的危险信号检测
+    danger_signals = {
+        "medical": [
+            ("自行用药", "请勿自行用药，务必在医生指导下治疗"),
+            ("催吐", "中毒情况下不要自行催吐，立即就医"),
+        ],
+        "legal": [
+            ("自行维权", "建议咨询专业律师"),
+        ],
+        "psychology": [
+            ("自行停药", "请不要自行停药，务必遵医嘱"),
+        ],
+        "exam": [
+            ("抄袭", "必须提交原创内容"),
+        ]
+    }
+    
+    signals = danger_signals.get(domain, [])
+    for signal, warning in signals:
+        if signal in response and warning not in response:
+            response += f"\n\n【重要提醒】{warning}"
+    
+    return response
+    
+
+def _apply_domain_error_corrections(response, question, domain):
+    """应用领域特定的错误修正"""
+    error_corrections = {
+        "medical": [
+            (r"闭经.*子宫内膜癌", "需排除妊娠后再评估", "闭经直接诊断为子宫内膜癌"),
+            (r"麻疹.*(扁桃体炎|痄腮)", "麻疹", "麻疹误诊为扁桃体炎或痄腮"),
+            (r"胃肠穿孔.*胰腺炎", "胃肠穿孔", "胃肠穿孔误诊为胰腺炎"),
+            (r"霍奇金病.*(白血病|淋巴瘤)", "霍奇金淋巴瘤", "霍奇金病与其他淋巴瘤混淆"),
+            (r"脑卒中.*自行用药", "立即就医，不要自行用药", "脑卒中自行用药风险"),
+            (r"心肌梗死.*阿司匹林", "立即就医，不要自行用药", "心梗自行用药风险"),
+            (r"中毒.*催吐", "不要自行催吐", "中毒自行催吐风险"),
+        ],
+        "legal": [
+            (r"口头协议.*证据效力", "书面合同具有更高证据效力", "忽视书面证据风险"),
+            (r"知识产权.*自行维权", "建议委托专业律师", "自行维权风险"),
+            (r"刑事.*自首", "自首可以从轻或减轻处罚", "未提及自首法律效果"),
+        ],
+        "psychology": [
+            (r"抑郁.*自行停药", "不要自行停药，遵医嘱", "自行停药风险"),
+            (r"自杀意念.*保密", "有伤害自己或他人风险时应突破保密原则", "保密原则误解"),
+        ],
+        "exam": [
+            (r"数学题.*近似值", "使用精确计算", "考试中不应使用近似值"),
+            (r"作文.*抄袭", "原创内容得分更高", "抄袭风险"),
+        ]
+    }
+    
+    corrections = error_corrections.get(domain, [])
+    for pattern, replacement, warning in corrections:
+        if re.search(pattern, question) and re.search(pattern, response):
+            logger.warning(f"检测到可能的领域错误: {warning}")
+            response = re.sub(pattern, replacement, response)
+    
+    return response
+    
 def ensure_chinese_output(text):
     """确保输出为纯中文"""
     # 替换英文术语
@@ -365,6 +456,104 @@ def ensure_chinese_output(text):
     text = re.sub(r'[a-zA-Z]{4,}', '', text)
     return text
 
+def copy_model_config_files(src_dir: str, dst_dir: str, override=True):
+    """
+    复制模型核心配置文件，确保与原始模型一致
+    
+    参数:
+        src_dir: 原始模型目录路径
+        dst_dir: 目标目录路径
+        override: 是否覆盖目标目录中的已有文件
+    """
+    # 关键配置文件清单（按优先级排序）
+    config_files = [
+        'tokenizer_config.json',  # Tokenizer 核心配置
+        'special_tokens_map.json',  # 特殊token映射
+        'generation_config.json',  # 生成参数配置
+        'config.json',  # 模型结构定义
+        'model.safetensors.index.json',  # 分片模型索引
+        'tokenizer.json'  # Tokenizer 完整配置
+    ]
+    
+    # 可选补充文件（存在则复制）
+    supplementary_files = [
+        'vocab.json',
+        'merges.txt',
+        'added_tokens.json',
+        'preprocessor_config.json'
+    ]
+    
+    copied_files = []
+    skipped_files = []
+    
+    # 确保目标目录存在
+    os.makedirs(dst_dir, exist_ok=True)
+    
+    # 复制核心配置文件
+    for filename in config_files:
+        src_path = os.path.join(src_dir, filename)
+        dst_path = os.path.join(dst_dir, filename)
+        
+        # 检查源文件是否存在
+        if not os.path.exists(src_path):
+            skipped_files.append(filename)
+            continue
+            
+        # 检查是否覆盖
+        if os.path.exists(dst_path) and not override:
+            skipped_files.append(filename)
+            continue
+            
+        shutil.copy2(src_path, dst_path)
+        copied_files.append(filename)
+    
+    # 复制补充文件（可选）
+    for filename in supplementary_files:
+        src_path = os.path.join(src_dir, filename)
+        if os.path.exists(src_path):
+            shutil.copy2(src_path, os.path.join(dst_dir, filename))
+            copied_files.append(filename)
+    
+    # 记录结果
+    if copied_files:
+        logger.info(f"已复制 {len(copied_files)} 个配置文件到 {dst_dir}")
+    if skipped_files:
+        logger.warning(f"跳过 {len(skipped_files)} 个文件: {', '.join(skipped_files)}")
+    
+    return copied_files
+
+
+def copy_original_tokenizer_files(original_model_path: str, target_dir: str):
+    """将原始模型的 tokenizer 相关配置文件复制到目标目录，确保一致性。"""
+    files_to_copy = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "generation_config.json",
+    ]
+    for filename in files_to_copy:
+        src = os.path.join(original_model_path, filename)
+        dst = os.path.join(target_dir, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            logger.info(f"已复制原始文件: {filename} -> {dst}")
+        else:
+            logger.warning(f"原始文件不存在，跳过: {src}")
+
+def copy_model_config_files(src_dir: str, dst_dir: str, config_files=None):
+    """复制模型的核心配置文件，如 config.json"""
+    if config_files is None:
+        config_files = ['config.json', 'tokenizer_config.json', 'special_tokens_map.json', 'generation_config.json']
+    for filename in config_files:
+        src = os.path.join(src_dir, filename)
+        dst = os.path.join(dst_dir, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            logger.info(f"已复制配置文件: {filename} -> {dst}")
+        else:
+            logger.warning(f"配置文件不存在，跳过: {src}")
+            
+            
 # 当直接运行此文件时进行测试
 if __name__ == "__main__":
     setup_logging(logging.DEBUG)
